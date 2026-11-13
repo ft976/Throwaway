@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Throwaway — Disposable Temporary Email</title>
+  <meta name="description" content="Get an instant disposable email address, receive real incoming messages in your browser, and let everything expire automatically.">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body id="top">
+  <header class="site-header">
+    <div class="container header-inner">
+      <a href="#top" class="brand">Throwaway</a>
+      <nav class="site-nav" aria-label="Primary">
+        <a href="#top" class="nav-link">Home</a>
+        <a href="#api" class="nav-link">API</a>
+        <a href="#faq" class="nav-link">FAQ</a>
+        <a href="#privacy" class="nav-link">Privacy</a>
+      </nav>
+      <div class="header-actions">
+        <button type="button" id="notify-btn" class="btn btn-secondary btn-sm">Enable notifications</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container main-content">
+    <section class="address-panel" aria-labelledby="hero-heading">
+      <div class="hero-intro">
+        <h1 id="hero-heading">Temporary email address</h1>
+        <p class="hero-subtitle">Receive signups and verification emails without exposing your real inbox. Messages and addresses expire automatically.</p>
+      </div>
+
+      <div id="notice-banner" class="notice-banner" role="status" hidden></div>
+
+      <div class="address-bar">
+        <label for="address-input" class="sr-only">Your temporary email address</label>
+        <input
+          id="address-input"
+          class="address-input"
+          type="text"
+          readonly
+          value="Generating address..."
+          aria-label="Your temporary email address"
+        >
+        <div class="address-actions">
+          <button type="button" id="copy-btn" class="btn btn-primary">Copy</button>
+          <button type="button" id="refresh-btn" class="btn btn-secondary">
+            <svg class="btn-icon" id="refresh-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+              <polyline points="21 3 21 9 15 9"></polyline>
+            </svg>
+            <span>Refresh</span>
+          </button>
+          <button type="button" id="change-btn" class="btn btn-secondary">Change</button>
+          <button type="button" id="delete-address-btn" class="btn btn-danger-outline">Delete</button>
+        </div>
+      </div>
+
+      <div class="meta-strip">
+        <div class="expiry-block">
+          <div class="expiry-row">
+            <span id="expiry-text" class="expiry-text">--:-- left</span>
+            <button type="button" id="extend-btn" class="btn-link">Add time</button>
+          </div>
+          <div class="progress-track" aria-hidden="true">
+            <div id="expiry-progress" class="progress-fill"></div>
+          </div>
+        </div>
+        <div class="poll-status">
+          <span id="poll-text">Checking in 5s</span>
+        </div>
+      </div>
+    </section>
+
+    <div id="live-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+    <section id="inbox-section" class="workspace-card" aria-labelledby="inbox-heading">
+      <div class="inbox-header">
+        <h2 id="inbox-heading">Inbox</h2>
+        <span id="inbox-count" class="inbox-count">0 messages</span>
+      </div>
+
+      <div class="inbox-columns" aria-hidden="true">
+        <span>Sender</span>
+        <span>Subject</span>
+        <span class="col-date">Date</span>
+      </div>
+
+      <div id="empty-state" class="empty-state">
+        <div class="spinner" aria-hidden="true"></div>
+        <p class="empty-title">Your inbox is empty. Waiting for incoming emails.</p>
+        <p class="empty-hint">Incoming messages are checked automatically every 5 seconds.</p>
+      </div>
+
+      <ul id="message-list" class="message-list" hidden></ul>
+    </section>
+
+    <section id="message-view" class="workspace-card message-view" aria-labelledby="msg-subject" hidden>
+      <div class="message-toolbar">
+        <button type="button" id="back-btn" class="btn btn-secondary btn-sm">Back to inbox</button>
+        <button type="button" id="delete-msg-btn" class="btn btn-danger-outline btn-sm">Delete message</button>
+      </div>
+
+      <div class="message-meta">
+        <h2 id="msg-subject" class="msg-subject"></h2>
+        <div class="msg-details">
+          <span id="msg-from" class="msg-from"></span>
+          <span class="sep" aria-hidden="true">·</span>
+          <time id="msg-date" class="msg-date"></time>
+        </div>
+      </div>
+
+      <div id="msg-attachments" class="msg-attachments" hidden>
+        <span class="attachments-label">Attachments:</span>
+        <ul id="attachments-list" class="attachments-list"></ul>
+      </div>
+
+      <div class="viewer-controls">
+        <div class="segmented" role="group" aria-label="Message format">
+          <button type="button" id="mode-html-btn" class="seg-btn is-active" aria-pressed="true">HTML</button>
+          <button type="button" id="mode-text-btn" class="seg-btn" aria-pressed="false">Plain text</button>
+        </div>
+
+        <div id="image-guard" class="image-guard" hidden>
+          <button type="button" id="load-images-btn" class="btn btn-secondary btn-sm">Load images</button>
+          <span id="image-guard-note" class="image-guard-note">Loading remote images tells the sender the email was opened.</span>
+        </div>
+      </div>
+
+      <div class="message-body-wrap">
+        <iframe
+          id="message-iframe"
+          class="message-iframe"
+          title="Sanitized email message"
+          sandbox="allow-popups allow-popups-to-escape-sandbox"
+          referrerpolicy="no-referrer"
+        ></iframe>
+        <pre id="message-plain" class="plain-text-body" hidden></pre>
+      </div>
+    </section>
+
+    <section class="editorial-section" aria-labelledby="what-is-heading">
+      <div class="editorial-grid">
+        <div>
+          <h2 id="what-is-heading">What is disposable email?</h2>
+          <p class="editorial-lead">
+            A disposable email address gives you a temporary inbox for one-off registrations, receipts, and download links without sharing your personal mailbox.
+          </p>
+          <p class="editorial-copy">
+            Once the countdown expires, the address and every message delivered to it are permanently erased from memory. Nothing is archived, forwarded, or linked to an account.
+          </p>
+        </div>
+        <div id="how-it-works">
+          <h2>How it works</h2>
+          <ol class="steps-list">
+            <li>
+              <span class="step-num">01.</span>
+              <div>
+                <h3>Grab an instant address</h3>
+                <p>A random address is ready as soon as the page opens, or customize a username on any listed domain.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-num">02.</span>
+              <div>
+                <h3>Use it for signups</h3>
+                <p>Paste the address wherever an email confirmation is required. New messages appear automatically within seconds.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-num">03.</span>
+              <div>
+                <h3>Auto-deletes on expiry</h3>
+                <p>Extend the timer if you need more time, or delete the inbox immediately when you are done.</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section id="api" class="editorial-section" aria-labelledby="api-heading">
+      <div class="section-head-row">
+        <div>
+          <h2 id="api-heading">Public API &amp; Secrets</h2>
+          <p class="editorial-copy">
+            Automate disposable inboxes over REST or Server-Sent Events using <code>/api/v1</code>, rotate your inbox Bearer secret, or generate a scoped developer API key.
+          </p>
+        </div>
+        <a href="/api/v1/openapi.json" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm">OpenAPI 3.0.3 JSON</a>
+      </div>
+
+      <div class="api-grid">
+        <div class="api-card">
+          <h3>Inbox Bearer Secret</h3>
+          <p class="api-card-desc">
+            Every inbox endpoint requires its secret Bearer token. Rotate it anytime to invalidate old sessions.
+          </p>
+          <div class="secret-input-row">
+            <label for="inbox-token-input" class="sr-only">Active inbox secret token</label>
+            <input
+              id="inbox-token-input"
+              class="form-input secret-input"
+              type="password"
+              readonly
+              value=""
+              aria-label="Active inbox secret token"
+            >
+            <button type="button" id="toggle-token-btn" class="btn btn-secondary btn-sm">Show</button>
+            <button type="button" id="copy-token-btn" class="btn btn-secondary btn-sm">Copy</button>
+            <button type="button" id="rotate-token-btn" class="btn btn-secondary btn-sm">Rotate</button>
+          </div>
+          <div class="curl-header">
+            <span class="curl-label">Live cURL example</span>
+            <button type="button" id="copy-curl-btn" class="btn-link">Copy cURL</button>
+          </div>
+          <pre id="api-curl-preview" class="code-block"></pre>
+        </div>
+
+        <div class="api-card">
+          <h3>Developer API Key</h3>
+          <p class="api-card-desc">
+            Generate a scoped <code>tw_live_</code> key for higher rate limits (120 inboxes/hr, 600 reads/min). Shown once upon creation.
+          </p>
+          <form id="api-key-form" class="key-create-row">
+            <label for="api-key-label" class="sr-only">API key label</label>
+            <input
+              id="api-key-label"
+              class="form-input"
+              type="text"
+              maxlength="40"
+              placeholder="Label (e.g. qa-runner)"
+              autocomplete="off"
+            >
+            <button type="submit" id="create-key-btn" class="btn btn-primary btn-sm">Create API key</button>
+          </form>
+          <div id="api-key-result" class="api-key-result" hidden>
+            <div class="secret-input-row">
+              <label for="api-key-output" class="sr-only">Generated developer API key</label>
+              <input
+                id="api-key-output"
+                class="form-input secret-input"
+                type="text"
+                readonly
+                value=""
+                aria-label="Generated developer API key"
+              >
+              <button type="button" id="copy-key-btn" class="btn btn-secondary btn-sm">Copy</button>
+              <button type="button" id="revoke-key-btn" class="btn btn-danger-outline btn-sm">Revoke</button>
+            </div>
+            <p id="api-key-meta" class="api-key-meta"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="api-table-wrap">
+        <table class="api-table">
+          <thead>
+            <tr>
+              <th scope="col">Endpoint</th>
+              <th scope="col">Auth / Secret</th>
+              <th scope="col">Behavior</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>GET /api/v1/domains</code></td>
+              <td>None</td>
+              <td>List active receiving domains</td>
+            </tr>
+            <tr>
+              <td><code>POST /api/v1/inbox</code></td>
+              <td>Optional <code>X-API-Key</code></td>
+              <td>Create random or custom inbox; issues one-time Bearer token</td>
+            </tr>
+            <tr>
+              <td><code>GET /api/v1/inbox/:address</code></td>
+              <td><code>Bearer &lt;token&gt;</code></td>
+              <td>List messages with ETag caching (<code>304</code> when unchanged)</td>
+            </tr>
+            <tr>
+              <td><code>GET /api/v1/inbox/:address/stream</code></td>
+              <td><code>Bearer &lt;token&gt;</code></td>
+              <td>Real-time Server-Sent Events stream for incoming messages</td>
+            </tr>
+            <tr>
+              <td><code>POST /api/v1/inbox/:address/rotate-token</code></td>
+              <td><code>Bearer &lt;token&gt;</code></td>
+              <td>Issue a fresh Bearer secret and revoke the prior token</td>
+            </tr>
+            <tr>
+              <td><code>POST /api/v1/keys</code> / <code>DELETE /api/v1/keys/me</code></td>
+              <td><code>X-API-Key</code></td>
+              <td>Create, inspect, or revoke scoped developer rate-limit keys</td>
+            </tr>
+            <tr>
+              <td><code>POST /api/v1/inbound/email</code></td>
+              <td><code>X-Webhook-Secret</code></td>
+              <td>HTTPS mail delivery for Cloudflare Email Workers &amp; relays</td>
+            </tr>
+            <tr>
+              <td><code>GET /api/v1/admin/status</code></td>
+              <td><code>Bearer &lt;ADMIN_SECRET&gt;</code></td>
+              <td>Runtime health &amp; Redis status (returns <code>404</code> if unset/invalid)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="faq" class="editorial-section" aria-labelledby="faq-heading">
+      <h2 id="faq-heading">Frequently asked questions</h2>
+      <div class="faq-list">
+        <details class="faq-item">
+          <summary>How long does an email address stay active?</summary>
+          <p>Each address remains active until its countdown reaches zero. You can click "Add time" at any point before expiry to reset the timer.</p>
+        </details>
+        <details class="faq-item">
+          <summary>Can I send emails from this address?</summary>
+          <p>No. Throwaway is receive-only. Outbound mail and SMTP authentication are disabled to prevent spam and abuse.</p>
+        </details>
+        <details class="faq-item">
+          <summary>Are attachments stored on the server?</summary>
+          <p>No. Attachment file contents are discarded at delivery. Only the filename, content type, and file size metadata are displayed.</p>
+        </details>
+        <details class="faq-item">
+          <summary>Why are images hidden when I open an email?</summary>
+          <p>Senders often embed remote tracking pixels in HTML emails. Remote images stay blocked until you explicitly choose "Load images".</p>
+        </details>
+        <details class="faq-item">
+          <summary>Can someone else read my inbox?</summary>
+          <p>Access requires a secret token issued once to your browser when the inbox is created. Without that token, the server returns 404.</p>
+        </details>
+      </div>
+    </section>
+
+    <section id="privacy" class="editorial-section" aria-labelledby="privacy-heading">
+      <h2 id="privacy-heading">Privacy</h2>
+      <p class="editorial-copy">
+        All active inboxes and messages are stored in memory only until their expiration timestamp is reached, at which point Redis automatically purges the keys.
+        Throwaway does not write incoming emails to long-term disk databases, does not store attachment payloads, strips unsafe HTML tags and scripts before storage, and blocks external image requests by default inside a sandboxed viewer.
+      </p>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span class="footer-brand">Throwaway</span>
+      <div class="footer-links">
+        <a href="#top">Home</a>
+        <a href="#api">API</a>
+        <a href="#faq">FAQ</a>
+        <a href="#privacy">Privacy</a>
+      </div>
+      <p class="footer-abuse">
+        Report abuse: <a id="abuse-link" href="mailto:abuse@localhost">abuse@localhost</a>
+      </p>
+    </div>
+  </footer>
+
+  <dialog id="change-dialog" class="modal-dialog" aria-labelledby="change-dialog-title">
+    <form id="change-form" method="dialog" class="dialog-panel" novalidate>
+      <div class="dialog-header">
+        <h2 id="change-dialog-title">Change email address</h2>
+        <button type="button" id="change-close-btn" class="btn-icon-close" aria-label="Close dialog">&times;</button>
+      </div>
+      <p class="dialog-desc">Pick your own-server domain or any live public mail domain, with a custom or random username.</p>
+
+      <div class="form-row">
+        <label for="username-input" class="form-label">Username (optional)</label>
+        <div class="address-builder">
+          <input
+            id="username-input"
+            name="username"
+            type="text"
+            class="form-input"
+            placeholder="Leave blank for random"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            maxlength="30"
+          >
+          <span class="at-sign" aria-hidden="true">@</span>
+          <label for="domain-select" class="sr-only">Domain</label>
+          <select id="domain-select" name="domain" class="form-select"></select>
+        </div>
+        <p id="change-error" class="form-error" role="alert" hidden></p>
+      </div>
+
+      <div class="dialog-footer">
+        <button type="button" id="random-name-btn" class="btn btn-secondary">Random</button>
+        <div class="dialog-footer-right">
+          <button type="button" id="change-cancel-btn" class="btn btn-secondary">Cancel</button>
+          <button type="submit" id="change-submit-btn" class="btn btn-primary">Set</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="delete-dialog" class="modal-dialog" aria-labelledby="delete-dialog-title">
+    <form id="delete-form" method="dialog" class="dialog-panel">
+      <div class="dialog-header">
+        <h2 id="delete-dialog-title">Delete this address?</h2>
+        <button type="button" id="delete-close-btn" class="btn-icon-close" aria-label="Close dialog">&times;</button>
+      </div>
+      <p class="dialog-desc">
+        This will permanently erase the current inbox and all received messages, then create a new random address.
+      </p>
+      <div class="dialog-footer dialog-footer-end">
+        <button type="button" id="delete-cancel-btn" class="btn btn-secondary">Cancel</button>
+        <button type="submit" id="delete-confirm-btn" class="btn btn-danger">Delete address</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>
