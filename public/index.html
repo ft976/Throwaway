@@ -52,6 +52,7 @@
             </svg>
             <span>Refresh</span>
           </button>
+          <button type="button" id="compose-btn" class="btn btn-secondary">Compose</button>
           <button type="button" id="change-btn" class="btn btn-secondary">Change</button>
           <button type="button" id="delete-address-btn" class="btn btn-danger-outline">Delete</button>
         </div>
@@ -91,6 +92,10 @@
         <div class="spinner" aria-hidden="true"></div>
         <p class="empty-title">Your inbox is empty. Waiting for incoming emails.</p>
         <p class="empty-hint">Incoming messages are checked automatically every 5 seconds.</p>
+        <div id="empty-actions" class="empty-actions" hidden>
+          <button type="button" id="send-test-btn" class="btn btn-secondary btn-sm">Send test email</button>
+          <button type="button" id="use-public-btn" class="btn btn-secondary btn-sm" hidden>Switch to public domain</button>
+        </div>
       </div>
 
       <ul id="message-list" class="message-list" hidden></ul>
@@ -285,6 +290,11 @@
               <td>Real-time Server-Sent Events stream for incoming messages</td>
             </tr>
             <tr>
+              <td><code>POST /api/v1/inbox/:address/send</code></td>
+              <td><code>Bearer &lt;token&gt;</code></td>
+              <td>Send an email from the active inbox to a local or external recipient</td>
+            </tr>
+            <tr>
               <td><code>POST /api/v1/inbox/:address/rotate-token</code></td>
               <td><code>Bearer &lt;token&gt;</code></td>
               <td>Issue a fresh Bearer secret and revoke the prior token</td>
@@ -318,7 +328,7 @@
         </details>
         <details class="faq-item">
           <summary>Can I send emails from this address?</summary>
-          <p>No. Throwaway is receive-only. Outbound mail and SMTP authentication are disabled to prevent spam and abuse.</p>
+          <p>Yes. Click &ldquo;Compose&rdquo; (or call <code>POST /api/v1/inbox/:address/send</code>) to send email from your active address. Delivery works immediately between local own-server addresses, between @mailto.plus / @fexpost.com public addresses, and externally over direct MX or an optional SMTP relay.</p>
         </details>
         <details class="faq-item">
           <summary>Are attachments stored on the server?</summary>
@@ -353,9 +363,6 @@
         <a href="#faq">FAQ</a>
         <a href="#privacy">Privacy</a>
       </div>
-      <p class="footer-abuse">
-        Report abuse: <a id="abuse-link" href="mailto:abuse@localhost">abuse@localhost</a>
-      </p>
     </div>
   </footer>
 
@@ -410,6 +417,67 @@
       <div class="dialog-footer dialog-footer-end">
         <button type="button" id="delete-cancel-btn" class="btn btn-secondary">Cancel</button>
         <button type="submit" id="delete-confirm-btn" class="btn btn-danger">Delete address</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="compose-dialog" class="modal-dialog modal-dialog-wide" aria-labelledby="compose-dialog-title">
+    <form id="compose-form" method="dialog" class="dialog-panel" novalidate>
+      <div class="dialog-header">
+        <h2 id="compose-dialog-title">Send email</h2>
+        <button type="button" id="compose-close-btn" class="btn-icon-close" aria-label="Close dialog">&times;</button>
+      </div>
+      <p class="dialog-desc">Send a message from your active disposable inbox. Local server, @mailto.plus/@fexpost.com, and external recipients are supported.</p>
+
+      <div class="form-row">
+        <label for="compose-from" class="form-label">From</label>
+        <input id="compose-from" type="text" class="form-input" readonly>
+      </div>
+
+      <div class="form-row">
+        <label for="compose-to" class="form-label">To</label>
+        <input
+          id="compose-to"
+          name="to"
+          type="email"
+          class="form-input"
+          placeholder="recipient@example.com"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck="false"
+          required
+        >
+      </div>
+
+      <div class="form-row">
+        <label for="compose-subject" class="form-label">Subject</label>
+        <input
+          id="compose-subject"
+          name="subject"
+          type="text"
+          class="form-input"
+          placeholder="Subject"
+          maxlength="200"
+        >
+      </div>
+
+      <div class="form-row">
+        <label for="compose-body" class="form-label">Message</label>
+        <textarea
+          id="compose-body"
+          name="body"
+          class="form-textarea"
+          rows="6"
+          placeholder="Write your message..."
+          maxlength="20000"
+          required
+        ></textarea>
+        <p id="compose-error" class="form-error" role="alert" hidden></p>
+      </div>
+
+      <div class="dialog-footer dialog-footer-end">
+        <button type="button" id="compose-cancel-btn" class="btn btn-secondary">Cancel</button>
+        <button type="submit" id="compose-submit-btn" class="btn btn-primary">Send email</button>
       </div>
     </form>
   </dialog>

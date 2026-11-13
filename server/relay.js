@@ -2,11 +2,15 @@
 
 const crypto = require('node:crypto');
 const sanitizeHtml = require('sanitize-html');
+const { simpleParser } = require('mailparser');
 const { normalizeAddress, generateRandomUsername } = require('./validate');
 
 const MAIL_TM_BASE = 'https://api.mail.tm';
 const TEMPMAIL_LOL_BASE = 'https://api.tempmail.lol/v2';
 const GUERRILLA_BASE = 'https://api.guerrillamail.com/ajax.php';
+const INBOXES_BASE = 'https://inboxes.com/api/v2';
+const TEMPMAIL_PLUS_BASE = 'https://tempmail.plus/api';
+const MAILDROP_GRAPHQL = 'https://api.maildrop.cc/graphql';
 
 const GUERRILLA_DOMAINS = [
   'guerrillamail.com',
@@ -18,6 +22,18 @@ const GUERRILLA_DOMAINS = [
   'grr.la',
   'spam4.me',
 ];
+
+const TEMPMAIL_PLUS_DOMAINS = [
+  'mailto.plus',
+  'fexpost.com',
+  'fexbox.org',
+  'mailbox.in.ua',
+  'rover.info',
+  'chitthi.in',
+  'merepost.com',
+];
+
+const MAILDROP_DOMAINS = ['maildrop.cc'];
 
 const DEFAULT_TIMEOUT_MS = 7000;
 const DOMAIN_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -56,6 +72,15 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
 
   let guerrillaReachable = false;
   let guerrillaCachedAt = 0;
+
+  let cachedInboxesDomains = [];
+  let inboxesCachedAt = 0;
+
+  let tempmailPlusReachable = false;
+  let tempmailPlusCachedAt = 0;
+
+  let maildropReachable = false;
+  let maildropCachedAt = 0;
 
   let inFlightDomainsPromise = null;
 
@@ -135,26 +160,96 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
     return guerrillaReachable;
   }
 
+  async function fetchInboxesDomains({ force = false } = {}) {
+    if (!force && cachedInboxesDomains.length > 0 && Date.now() - inboxesCachedAt < DOMAIN_CACHE_TTL_MS) {
+      return cachedInboxesDomains;
+    }
+    try {
+      const res = await requestJson(`${INBOXES_BASE}/domain`);
+      if (res.ok && res.data && Array.isArray(res.data.domains)) {
+        const list = res.data.domains
+          .map((item) => normalizeAddress(item && item.qdn))
+          .filter(Boolean);
+        if (list.length > 0) {
+          cachedInboxesDomains = Array.from(new Set(list));
+          inboxesCachedAt = Date.now();
+          return cachedInboxesDomains;
+        }
+      }
+    } catch {
+      // Fallback to cached domains if available
+    }
+    return cachedInboxesDomains;
+  }
+
+  async function checkTempmailPlusAvailability({ force = false } = {}) {
+    if (!force && tempmailPlusCachedAt > 0 && Date.now() - tempmailPlusCachedAt < PROBE_CACHE_TTL_MS) {
+      return tempmailPlusReachable;
+    }
+    try {
+      const res = await requestJson(`${TEMPMAIL_PLUS_BASE}/mails?email=twprobe%40mailto.plus&limit=1&epin=`);
+      tempmailPlusCachedAt = Date.now();
+      tempmailPlusReachable = Boolean(res.ok && res.data && res.data.result === true);
+    } catch {
+      tempmailPlusReachable = false;
+    }
+    return tempmailPlusReachable;
+  }
+
+  async function checkMaildropAvailability({ force = false } = {}) {
+    if (!force && maildropCachedAt > 0 && Date.now() - maildropCachedAt < PROBE_CACHE_TTL_MS) {
+      return maildropReachable;
+    }
+    try {
+      const res = await requestJson(MAILDROP_GRAPHQL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: 'query { inbox(mailbox:"twprobe") { id } }' }),
+      });
+      maildropCachedAt = Date.now();
+      maildropReachable = Boolean(res.ok && res.data && res.data.data && Array.isArray(res.data.data.inbox));
+    } catch {
+      maildropReachable = false;
+    }
+    return maildropReachable;
+  }
+
   async function fetchPublicDomains({ force = false } = {}) {
     if (!force && inFlightDomainsPromise) {
       return inFlightDomainsPromise;
     }
 
     const job = (async () => {
-      const [mailTmResult, tempmailLolResult, guerrillaResult] = await Promise.allSettled([
+      const [
+        mailTmResult,
+        tempmailLolResult,
+        guerrillaResult,
+        inboxesResult,
+        tempmailPlusResult,
+        maildropResult,
+      ] = await Promise.allSettled([
         fetchMailTmDomains({ force }),
         fetchTempmailLolDomains({ force }),
         checkGuerrillaAvailability({ force }),
+        fetchInboxesDomains({ force }),
+        checkTempmailPlusAvailability({ force }),
+        checkMaildropAvailability({ force }),
       ]);
 
       const mailTmDomains = mailTmResult.status === 'fulfilled' ? mailTmResult.value : [];
       const tempmailDomains = tempmailLolResult.status === 'fulfilled' ? tempmailLolResult.value : [];
       const hasGuerrilla = guerrillaResult.status === 'fulfilled' && guerrillaResult.value;
+      const inboxesDomains = inboxesResult.status === 'fulfilled' ? inboxesResult.value : [];
+      const hasTempmailPlus = tempmailPlusResult.status === 'fulfilled' && tempmailPlusResult.value;
+      const hasMaildrop = maildropResult.status === 'fulfilled' && maildropResult.value;
 
       const combined = [
         ...mailTmDomains,
         ...tempmailDomains,
         ...(hasGuerrilla ? GUERRILLA_DOMAINS : []),
+        ...inboxesDomains,
+        ...(hasTempmailPlus ? TEMPMAIL_PLUS_DOMAINS : []),
+        ...(hasMaildrop ? MAILDROP_DOMAINS : []),
       ];
 
       return Array.from(new Set(combined));
@@ -262,11 +357,58 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
     };
   }
 
+  function createInboxesInbox({ username, domain }) {
+    const effectiveUser = username || generateRandomUsername(10);
+    const address = normalizeAddress(`${effectiveUser}@${domain}`);
+    return {
+      address,
+      upstream: {
+        provider: 'inboxes.com',
+        address,
+      },
+    };
+  }
+
+  function createTempmailPlusInbox({ username, domain }) {
+    const effectiveUser = username || generateRandomUsername(10);
+    const address = normalizeAddress(`${effectiveUser}@${domain}`);
+    return {
+      address,
+      upstream: {
+        provider: 'tempmail.plus',
+        address,
+      },
+    };
+  }
+
+  function createMaildropInbox({ username }) {
+    const mailbox = username || generateRandomUsername(10);
+    const address = normalizeAddress(`${mailbox}@maildrop.cc`);
+    return {
+      address,
+      upstream: {
+        provider: 'maildrop.cc',
+        mailbox,
+        address,
+      },
+    };
+  }
+
   async function provisionPublicInbox({ username, domain } = {}) {
-    const [mailTmDomains, tempmailDomains, hasGuerrilla] = await Promise.all([
+    const [
+      mailTmDomains,
+      tempmailDomains,
+      hasGuerrilla,
+      inboxesDomains,
+      hasTempmailPlus,
+      hasMaildrop,
+    ] = await Promise.all([
       fetchMailTmDomains(),
       fetchTempmailLolDomains(),
       checkGuerrillaAvailability(),
+      fetchInboxesDomains(),
+      checkTempmailPlusAvailability(),
+      checkMaildropAvailability(),
     ]);
 
     const cleanDomain = domain ? normalizeAddress(domain) : '';
@@ -295,6 +437,18 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
         return createTempmailLolInbox({ prefix: username, domain: cleanDomain });
       }
 
+      if (inboxesDomains.includes(cleanDomain)) {
+        return createInboxesInbox({ username, domain: cleanDomain });
+      }
+
+      if (TEMPMAIL_PLUS_DOMAINS.includes(cleanDomain)) {
+        return createTempmailPlusInbox({ username, domain: cleanDomain });
+      }
+
+      if (MAILDROP_DOMAINS.includes(cleanDomain)) {
+        return createMaildropInbox({ username });
+      }
+
       return null;
     }
 
@@ -305,6 +459,15 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
         } catch (err) {
           if (err.statusCode === 409) throw err;
         }
+      }
+      if (inboxesDomains.length > 0) {
+        return createInboxesInbox({ username, domain: inboxesDomains[0] });
+      }
+      if (hasTempmailPlus) {
+        return createTempmailPlusInbox({ username, domain: TEMPMAIL_PLUS_DOMAINS[0] });
+      }
+      if (hasMaildrop) {
+        return createMaildropInbox({ username });
       }
       if (hasGuerrilla) {
         try {
@@ -330,6 +493,19 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
           if (err.statusCode !== 409) break;
         }
       }
+    }
+
+    if (inboxesDomains.length > 0) {
+      const chosen = inboxesDomains[crypto.randomInt(0, inboxesDomains.length)];
+      return createInboxesInbox({ domain: chosen });
+    }
+
+    if (hasTempmailPlus) {
+      return createTempmailPlusInbox({ domain: TEMPMAIL_PLUS_DOMAINS[0] });
+    }
+
+    if (hasMaildrop) {
+      return createMaildropInbox({});
     }
 
     if (hasGuerrilla) {
@@ -397,7 +573,9 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
       const rawHtml = Array.isArray(full.html)
         ? full.html.join('\n')
         : (typeof full.html === 'string' ? full.html : '');
-      const text = typeof full.text === 'string' ? full.text : String(full.intro || '');
+      const text = typeof full.text === 'string'
+        ? full.text
+        : (rawHtml ? stripTagsToText(rawHtml) : String(full.intro || ''));
       const fromObj = full.from && typeof full.from === 'object' ? full.from : {};
 
       newMessages.push({
@@ -418,7 +596,6 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
       });
     }
 
-    // Oldest first so saveMessage LPUSH puts newest first
     newMessages.reverse();
     return { messages: newMessages, refreshedJwt: jwt !== upstream.jwt ? jwt : '' };
   }
@@ -436,7 +613,6 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
     const newMessages = [];
     for (const summary of listRes.data.list) {
       if (!summary || !summary.mail_id) continue;
-      // Skip default Guerrilla Mail promo welcome item
       if (String(summary.mail_id) === '1' && Number(summary.mail_timestamp || 0) === 0) {
         continue;
       }
@@ -501,18 +677,222 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
         if (!Number.isNaN(d.getTime())) dateIso = d.toISOString();
       }
 
+      const rawHtml = typeof em.html === 'string' ? em.html : '';
+      const text = em.body ? String(em.body) : (rawHtml ? stripTagsToText(rawHtml) : '');
+
       newMessages.push({
         externalId: extId,
         from: parsedFrom.from,
         fromName: parsedFrom.fromName,
         subject: String(em.subject || '(No subject)'),
         date: dateIso,
-        text: String(em.body || ''),
-        rawHtml: typeof em.html === 'string' ? em.html : '',
+        text,
+        rawHtml,
         attachments: [],
       });
     }
 
+    return { messages: newMessages, refreshedJwt: '' };
+  }
+
+  async function fetchInboxesMessages(upstream, seenSet) {
+    if (!upstream || !upstream.address) {
+      return { messages: [], refreshedJwt: '' };
+    }
+    const listRes = await requestJson(`${INBOXES_BASE}/inbox/${encodeURIComponent(upstream.address)}`);
+    if (!listRes.ok || !listRes.data || !Array.isArray(listRes.data.msgs)) {
+      return { messages: [], refreshedJwt: '' };
+    }
+
+    const newMessages = [];
+    for (const summary of listRes.data.msgs) {
+      if (!summary || !summary.uid) continue;
+      const extId = `inboxes:${summary.uid}`;
+      if (seenSet.has(extId)) continue;
+
+      const detailRes = await requestJson(`${INBOXES_BASE}/message/${encodeURIComponent(summary.uid)}`);
+      if (!detailRes.ok || !detailRes.data) continue;
+      const full = detailRes.data;
+
+      const parsedFrom = parseFromHeader(full.ff || full.f || summary.f);
+      const rawHtml = typeof full.html === 'string' ? full.html : '';
+      const text = typeof full.text === 'string' && full.text.trim()
+        ? full.text
+        : (rawHtml ? stripTagsToText(rawHtml) : '');
+      const dateStr = full.cr || summary.cr;
+      const parsedDate = dateStr ? new Date(dateStr) : null;
+      const dateIso = parsedDate && !Number.isNaN(parsedDate.getTime())
+        ? parsedDate.toISOString()
+        : new Date().toISOString();
+
+      newMessages.push({
+        externalId: extId,
+        from: parsedFrom.from,
+        fromName: parsedFrom.fromName,
+        subject: String(full.s || summary.s || '(No subject)'),
+        date: dateIso,
+        text,
+        rawHtml,
+        attachments: Array.isArray(full.at)
+          ? full.at.map((att) => ({
+            filename: String((att && (att.filename || att.name)) || 'attachment'),
+            size: Number((att && att.size) || 0),
+            contentType: String((att && (att.contentType || att.type)) || 'application/octet-stream'),
+          }))
+          : [],
+      });
+    }
+
+    newMessages.reverse();
+    return { messages: newMessages, refreshedJwt: '' };
+  }
+
+  async function fetchTempmailPlusMessages(upstream, seenSet) {
+    if (!upstream || !upstream.address) {
+      return { messages: [], refreshedJwt: '' };
+    }
+    const listRes = await requestJson(
+      `${TEMPMAIL_PLUS_BASE}/mails?email=${encodeURIComponent(upstream.address)}&limit=20&epin=`
+    );
+    if (!listRes.ok || !listRes.data || !Array.isArray(listRes.data.mail_list)) {
+      return { messages: [], refreshedJwt: '' };
+    }
+
+    const newMessages = [];
+    for (const summary of listRes.data.mail_list) {
+      if (!summary || !summary.mail_id) continue;
+      const extId = `tmplus:${summary.mail_id}`;
+      if (seenSet.has(extId)) continue;
+
+      const detailRes = await requestJson(
+        `${TEMPMAIL_PLUS_BASE}/mails/${encodeURIComponent(summary.mail_id)}?email=${encodeURIComponent(upstream.address)}&epin=`
+      );
+      if (!detailRes.ok || !detailRes.data || detailRes.data.result === false) continue;
+      const full = detailRes.data;
+
+      const rawHtml = typeof full.html === 'string' ? full.html : '';
+      const text = typeof full.text === 'string' && full.text
+        ? full.text
+        : (rawHtml ? stripTagsToText(rawHtml) : '');
+      const fromAddr = normalizeAddress(full.from_mail || summary.from_mail || full.from) || 'unknown@unknown';
+      const fromName = String(full.from_name || summary.from_name || '');
+      const parsedDate = full.date ? new Date(full.date) : null;
+      const dateIso = parsedDate && !Number.isNaN(parsedDate.getTime())
+        ? parsedDate.toISOString()
+        : new Date().toISOString();
+
+      newMessages.push({
+        externalId: extId,
+        from: fromAddr,
+        fromName,
+        subject: String(full.subject || summary.subject || '(No subject)'),
+        date: dateIso,
+        text,
+        rawHtml,
+        attachments: Array.isArray(full.attachments)
+          ? full.attachments.map((att) => ({
+            filename: String((att && (att.name || att.filename)) || 'attachment'),
+            size: Number((att && att.size) || 0),
+            contentType: String((att && (att.contentType || att.type)) || 'application/octet-stream'),
+          }))
+          : [],
+      });
+    }
+
+    newMessages.reverse();
+    return { messages: newMessages, refreshedJwt: '' };
+  }
+
+  async function fetchMaildropMessages(upstream, seenSet) {
+    if (!upstream || !upstream.mailbox) {
+      return { messages: [], refreshedJwt: '' };
+    }
+    const mailbox = upstream.mailbox;
+    const listRes = await requestJson(MAILDROP_GRAPHQL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: 'query($m: String!) { inbox(mailbox: $m) { id headerfrom subject date } }',
+        variables: { m: mailbox },
+      }),
+    });
+    const list = listRes.data && listRes.data.data && Array.isArray(listRes.data.data.inbox)
+      ? listRes.data.data.inbox
+      : null;
+    if (!listRes.ok || !list) {
+      return { messages: [], refreshedJwt: '' };
+    }
+
+    const newMessages = [];
+    for (const summary of list) {
+      if (!summary || !summary.id) continue;
+      const extId = `maildrop:${summary.id}`;
+      if (seenSet.has(extId)) continue;
+
+      const detailRes = await requestJson(MAILDROP_GRAPHQL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: 'query($m: String!, $id: String!) { message(mailbox: $m, id: $id) { id headerfrom mailfrom subject date data html } }',
+          variables: { m: mailbox, id: summary.id },
+        }),
+      });
+      const full = detailRes.data && detailRes.data.data && detailRes.data.data.message;
+      if (!detailRes.ok || !full) continue;
+
+      let parsedFrom = parseFromHeader(full.headerfrom || summary.headerfrom || full.mailfrom);
+      let subject = String(full.subject || summary.subject || '(No subject)');
+      let rawHtml = typeof full.html === 'string' ? full.html : '';
+      let text = '';
+      let attachments = [];
+      let dateIso = new Date().toISOString();
+      if (full.date || summary.date) {
+        const d = new Date(full.date || summary.date);
+        if (!Number.isNaN(d.getTime())) dateIso = d.toISOString();
+      }
+
+      if (typeof full.data === 'string' && full.data.trim()) {
+        try {
+          const parsedMime = await simpleParser(full.data);
+          const fromEntry = parsedMime.from && Array.isArray(parsedMime.from.value) && parsedMime.from.value[0];
+          if (fromEntry && fromEntry.address) {
+            parsedFrom = {
+              from: normalizeAddress(fromEntry.address) || parsedFrom.from,
+              fromName: String(fromEntry.name || parsedFrom.fromName || ''),
+            };
+          }
+          if (parsedMime.subject) subject = String(parsedMime.subject).trim();
+          if (typeof parsedMime.html === 'string' && parsedMime.html) rawHtml = parsedMime.html;
+          if (parsedMime.text) text = String(parsedMime.text);
+          if (Array.isArray(parsedMime.attachments)) {
+            attachments = parsedMime.attachments.map((att) => ({
+              filename: String(att.filename || 'attachment'),
+              size: Number(att.size || (att.content ? att.content.length : 0)),
+              contentType: String(att.contentType || 'application/octet-stream'),
+            }));
+          }
+        } catch {
+          // Fallback to metadata + rawHtml below
+        }
+      }
+
+      if (!text) {
+        text = rawHtml ? stripTagsToText(rawHtml) : '';
+      }
+
+      newMessages.push({
+        externalId: extId,
+        from: parsedFrom.from,
+        fromName: parsedFrom.fromName,
+        subject,
+        date: dateIso,
+        text,
+        rawHtml,
+        attachments,
+      });
+    }
+
+    newMessages.reverse();
     return { messages: newMessages, refreshedJwt: '' };
   }
 
@@ -531,10 +911,41 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
       if (upstream.provider === 'tempmail.lol') {
         return await fetchTempmailLolMessages(upstream, seenSet);
       }
+      if (upstream.provider === 'inboxes.com') {
+        return await fetchInboxesMessages(upstream, seenSet);
+      }
+      if (upstream.provider === 'tempmail.plus') {
+        return await fetchTempmailPlusMessages(upstream, seenSet);
+      }
+      if (upstream.provider === 'maildrop.cc') {
+        return await fetchMaildropMessages(upstream, seenSet);
+      }
     } catch {
       // Non-fatal upstream poll error
     }
     return { messages: [], refreshedJwt: '' };
+  }
+
+  async function sendTempmailPlusMail({ from, to, subject, text }) {
+    const res = await requestJson(`${TEMPMAIL_PLUS_BASE}/mails/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        email: normalizeAddress(from),
+        to: normalizeAddress(to),
+        subject: String(subject || '(No subject)'),
+        text: String(text || ''),
+      }),
+    });
+
+    if (!res.ok || !res.data || res.data.result !== true) {
+      const msg = (res.data && res.data.err && res.data.err.msg) || 'Public tempmail.plus send failed.';
+      const err = new Error(msg);
+      err.statusCode = 502;
+      throw err;
+    }
+
+    return { delivered: true, transport: 'tempmail.plus', to: normalizeAddress(to) };
   }
 
   async function deleteUpstreamInbox(upstream) {
@@ -560,6 +971,7 @@ function createPublicMailRelay({ fetchImpl = globalThis.fetch } = {}) {
     fetchPublicDomains,
     provisionPublicInbox,
     fetchUpstreamMessages,
+    sendTempmailPlusMail,
     deleteUpstreamInbox,
   };
 }
@@ -568,4 +980,6 @@ module.exports = {
   createPublicMailRelay,
   parseFromHeader,
   GUERRILLA_DOMAINS,
+  TEMPMAIL_PLUS_DOMAINS,
+  MAILDROP_DOMAINS,
 };

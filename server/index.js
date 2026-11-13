@@ -18,22 +18,22 @@ async function start() {
 
   const redis = createRedisClient(config);
   const store = createStore(redis, config);
-  const app = createApp({ config, redis, store });
-
-  const httpServer = http.createServer(app);
   const smtpServer = createSmtpServer({ config, store });
-
-  await new Promise((resolve, reject) => {
-    httpServer.once('error', reject);
-    httpServer.listen(config.httpPort, '0.0.0.0', resolve);
-  });
-  console.log(`HTTP server listening on port ${config.httpPort} (domains: ${config.domains.join(', ')})`);
 
   await new Promise((resolve, reject) => {
     smtpServer.once('error', reject);
     smtpServer.listen(config.smtpPort, '0.0.0.0', resolve);
   });
   console.log(`SMTP server listening on port ${config.smtpPort}`);
+
+  const app = createApp({ config, redis, store, smtpServer });
+  const httpServer = http.createServer(app);
+
+  await new Promise((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(config.httpPort, '0.0.0.0', resolve);
+  });
+  console.log(`HTTP server listening on port ${config.httpPort} (domains: ${config.domains.join(', ')})`);
 
   let shuttingDown = false;
   const shutdown = async (signal) => {

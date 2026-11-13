@@ -183,6 +183,20 @@ function createStore(redis, config, { relay: injectedRelay } = {}) {
     const targetDomain = cleanDomain
       || (hasUsername ? config.domains[0] : config.domains[crypto.randomInt(0, config.domains.length)]);
 
+    let companionUpstream = undefined;
+    if (relay && targetIsOwnServerDomain) {
+      try {
+        const provisioned = await relay.provisionPublicInbox({
+          username: cleanUsername,
+        });
+        if (provisioned && provisioned.upstream) {
+          companionUpstream = provisioned.upstream;
+        }
+      } catch {
+        // Non-fatal upstream mirror fallback
+      }
+    }
+
     if (cleanUsername) {
       const address = `${cleanUsername}@${targetDomain}`;
       const token = crypto.randomBytes(32).toString('base64url');
@@ -192,6 +206,8 @@ function createStore(redis, config, { relay: injectedRelay } = {}) {
         tokenHash: hashToken(token),
         createdAt: now,
         expiresAt,
+        upstream: companionUpstream,
+        seenExternalIds: [],
       });
 
       const created = await redis.set(inboxKey(address), payload, 'NX', 'PX', ttlMs);
@@ -214,6 +230,8 @@ function createStore(redis, config, { relay: injectedRelay } = {}) {
         tokenHash: hashToken(token),
         createdAt: now,
         expiresAt,
+        upstream: companionUpstream,
+        seenExternalIds: [],
       });
 
       const created = await redis.set(inboxKey(address), payload, 'NX', 'PX', ttlMs);
@@ -680,6 +698,7 @@ function createStore(redis, config, { relay: injectedRelay } = {}) {
     createApiKey,
     verifyApiKey,
     revokeApiKey,
+    relay,
   };
 }
 

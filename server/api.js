@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const dns = require('node:dns');
 const path = require('node:path');
 const express = require('express');
 const helmet = require('helmet');
@@ -10,6 +11,7 @@ const { simpleParser } = require('mailparser');
 const { normalizeAddress, validateAddressSyntax } = require('./validate');
 const { sanitizeEmailHtml, createSnippet } = require('./sanitize');
 const { verifySharedSecret } = require('./store');
+const { verifySmtpConnectivity, sendInternalSmtpMail, sendOutboundEmail, stripHtmlToText } = require('./smtp');
 
 class RedisRateLimitStore {
   constructor(redis, prefix) {
@@ -108,10 +110,22 @@ function buildOpenApiSpec(config) {
       },
     },
     paths: {
+      '/health': {
+        get: {
+          summary: 'Check Redis and internal SMTP server readiness',
+          responses: { 200: { description: 'Backend ready' }, 503: { description: 'Service unavailable' } },
+        },
+      },
       '/domains': {
         get: {
           summary: 'List active receiving domains',
           responses: { 200: { description: 'List of domains' } },
+        },
+      },
+      '/domains/status': {
+        get: {
+          summary: 'Check SMTP readiness and public MX DNS status for own-server domains',
+          responses: { 200: { description: 'Domain delivery status' } },
         },
       },
       '/inbox': {
@@ -144,6 +158,25 @@ function buildOpenApiSpec(config) {
           summary: `Reset inbox expiry timer (+${config.inboxTtlMinutes} minutes)`,
           security: [{ InboxBearer: [] }],
           responses: { 200: { description: 'Updated expiry timestamp' }, 404: { description: 'Not Found' } },
+        },
+      },
+      '/inbox/{address}/test-email': {
+        post: {
+          summary: 'Send a live test email through the internal SMTP server to an own-server inbox',
+          security: [{ InboxBearer: [] }],
+          responses: { 202: { description: 'Test email delivered over SMTP' }, 400: { description: 'Unsupported inbox' }, 404: { description: 'Not Found' } },
+        },
+      },
+      '/inbox/{address}/send': {
+        post: {
+          summary: 'Send an email from the active disposable inbox to a local or external recipient',
+          security: [{ InboxBearer: [] }],
+          responses: {
+            202: { description: 'Email accepted for delivery' },
+            400: { description: 'Invalid recipient or empty body' },
+            404: { description: 'Inbox or local recipient not found' },
+            502: { description: 'Upstream mail transport error' },
+          },
         },
       },
       '/inbox/{address}/rotate-token': {
@@ -201,8 +234,125 @@ function buildOpenApiSpec(config) {
   };
 }
 
-function createApp({ config, redis, store, rateLimits = {} }) {
+function createApp({
+  config,
+  redis,
+  store,
+  smtpServer = null,
+  checkSmtpHealth = null,
+  resolveMx = null,
+  createTransport = null,
+  rateLimits = {},
+}) {
   const app = express();
+  const mxCache = new Map();
+  const MX_CACHE_TTL_MS = 60 * 1000;
+
+  async function checkRedisHealth() {
+    try {
+      const pong = await redis.ping();
+      return pong === 'PONG'
+        ? { ok: true }
+        : { ok: false, error: 'Unexpected Redis PING response.' };
+    } catch (err) {
+      return { ok: false, error: err && err.message ? err.message : 'Redis ping failed.' };
+    }
+  }
+
+  async function checkSmtpStatus() {
+    if (typeof checkSmtpHealth === 'function') {
+      return checkSmtpHealth();
+    }
+    return verifySmtpConnectivity(smtpServer);
+  }
+
+  async function runReadinessChecks() {
+    const [redisResult, smtpResult] = await Promise.all([
+      checkRedisHealth(),
+      checkSmtpStatus(),
+    ]);
+    return {
+      ok: Boolean(redisResult.ok && smtpResult.ok),
+      redis: redisResult,
+      smtp: smtpResult,
+    };
+  }
+
+  async function inspectDomainMx(domain) {
+    if (domain.endsWith('.local')) {
+      return {
+        domain,
+        mxStatus: 'local',
+        mxRecords: [],
+        readyForExternalMail: false,
+      };
+    }
+
+    const cached = mxCache.get(domain);
+    if (cached && Date.now() - cached.checkedAt < MX_CACHE_TTL_MS) {
+      return cached.value;
+    }
+
+    const mxResolver = typeof resolveMx === 'function'
+      ? resolveMx
+      : (d) => dns.promises.resolveMx(d);
+
+    let timer;
+    try {
+      const records = await Promise.race([
+        mxResolver(domain),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('ETIMEOUT')), 3000);
+          if (timer.unref) timer.unref();
+        }),
+      ]);
+
+      const list = Array.isArray(records) ? records : [];
+      const validExchanges = list
+        .map((r) => String((r && r.exchange) || '').trim())
+        .filter((ex) => ex && ex !== '.');
+
+      let value;
+      if (validExchanges.length > 0) {
+        value = {
+          domain,
+          mxStatus: 'ok',
+          mxRecords: validExchanges,
+          readyForExternalMail: true,
+        };
+      } else if (list.length > 0) {
+        value = {
+          domain,
+          mxStatus: 'null-mx',
+          mxRecords: [],
+          readyForExternalMail: false,
+        };
+      } else {
+        value = {
+          domain,
+          mxStatus: 'missing',
+          mxRecords: [],
+          readyForExternalMail: false,
+        };
+      }
+
+      mxCache.set(domain, { checkedAt: Date.now(), value });
+      return value;
+    } catch (err) {
+      const code = err && (err.code || err.message);
+      const mxStatus = code === 'ENODATA' || code === 'ENOTFOUND' ? 'missing' : 'unknown';
+      const value = {
+        domain,
+        mxStatus,
+        mxRecords: [],
+        readyForExternalMail: false,
+      };
+      mxCache.set(domain, { checkedAt: Date.now(), value });
+      return value;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   app.set('trust proxy', config.trustProxy);
   app.disable('x-powered-by');
@@ -253,6 +403,7 @@ function createApp({ config, redis, store, rateLimits = {} }) {
   }
 
   const smallJsonParser = express.json({ limit: '2kb' });
+  const composeJsonParser = express.json({ limit: '128kb' });
   const inboundJsonParser = express.json({ limit: config.maxMessageBytes });
 
   const jsonErrorHandler = (err, _req, res, next) => {
@@ -303,15 +454,11 @@ function createApp({ config, redis, store, rateLimits = {} }) {
   });
 
   app.get('/healthz', async (_req, res) => {
-    try {
-      const pong = await redis.ping();
-      if (pong === 'PONG') {
-        return res.status(200).type('text/plain').send('ok');
-      }
-      return res.status(503).type('text/plain').send('error');
-    } catch {
-      return res.status(503).type('text/plain').send('error');
+    const checks = await runReadinessChecks();
+    if (checks.ok) {
+      return res.status(200).type('text/plain').send('ok');
     }
+    return res.status(503).type('text/plain').send('error');
   });
 
   async function optionalApiKeyAuth(req, res, next) {
@@ -400,8 +547,10 @@ function createApp({ config, redis, store, rateLimits = {} }) {
         const date = parsed.date instanceof Date && !Number.isNaN(parsed.date.getTime())
           ? parsed.date.toISOString()
           : new Date().toISOString();
-        const text = parsed.text ? String(parsed.text) : '';
         const rawHtml = typeof parsed.html === 'string' ? parsed.html : '';
+        const text = parsed.text
+          ? String(parsed.text)
+          : (rawHtml ? stripHtmlToText(rawHtml) : '');
         const html = rawHtml ? sanitizeEmailHtml(rawHtml) : '';
         const snippet = createSnippet(text, rawHtml);
         const attachments = Array.isArray(parsed.attachments)
@@ -427,8 +576,10 @@ function createApp({ config, redis, store, rateLimits = {} }) {
             date = parsedDate.toISOString();
           }
         }
-        const text = body.text ? String(body.text) : '';
         const rawHtml = typeof body.html === 'string' ? body.html : '';
+        const text = body.text
+          ? String(body.text)
+          : (rawHtml ? stripHtmlToText(rawHtml) : '');
         const html = rawHtml ? sanitizeEmailHtml(rawHtml) : '';
         const snippet = createSnippet(text, rawHtml);
         const attachments = Array.isArray(body.attachments)
@@ -459,17 +610,82 @@ function createApp({ config, redis, store, rateLimits = {} }) {
     }
   });
 
+  // Outbound Send Email from an authorized inbox (128kb body limit)
+  apiRouter.post(
+    '/inbox/:address/send',
+    otherApiLimiter,
+    requireInboxAuth,
+    composeJsonParser,
+    jsonErrorHandler,
+    async (req, res) => {
+      try {
+        const auth = await store.getAuthorizedInbox(req.inboxAddress, req.inboxToken);
+        if (!auth) {
+          return res.status(404).json({ error: 'Inbox not found.' });
+        }
+
+        const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+        const rawTo = typeof body.to === 'string' ? body.to : '';
+        const toCheck = validateAddressSyntax(rawTo);
+        if (!toCheck.valid) {
+          return res.status(400).json({ error: toCheck.error || 'Valid recipient email address is required.' });
+        }
+
+        const subject = typeof body.subject === 'string'
+          ? body.subject.replace(/[\r\n]+/g, ' ').trim().slice(0, 200)
+          : '';
+        const text = typeof body.text === 'string' ? body.text : '';
+        const html = typeof body.html === 'string' ? body.html : '';
+
+        if (!text.trim() && !html.trim()) {
+          return res.status(400).json({ error: 'Message body is required.' });
+        }
+
+        const sendOpts = {
+          config,
+          smtpServer,
+          store,
+          relay: store.relay || null,
+          from: auth.address,
+          to: toCheck.address,
+          subject: subject || '(No subject)',
+          text,
+          html,
+        };
+        if (typeof resolveMx === 'function') {
+          sendOpts.resolveMx = resolveMx;
+        }
+        if (typeof createTransport === 'function') {
+          sendOpts.createTransport = createTransport;
+        }
+
+        const result = await sendOutboundEmail(sendOpts);
+        return res.status(202).json({
+          sent: true,
+          from: result.from,
+          to: result.to,
+          transport: result.transport,
+        });
+      } catch (err) {
+        const status = err && err.statusCode ? err.statusCode : 502;
+        return res.status(status).json({ error: (err && err.message) || 'Could not send email.' });
+      }
+    }
+  );
+
   // Standard 2kb JSON body parser for all other API routes
   apiRouter.use(smallJsonParser);
   apiRouter.use(jsonErrorHandler);
 
   apiRouter.get('/health', async (_req, res) => {
-    try {
-      const pong = await redis.ping();
-      return res.status(pong === 'PONG' ? 200 : 503).json({ status: pong === 'PONG' ? 'ok' : 'error' });
-    } catch {
-      return res.status(503).json({ status: 'error' });
-    }
+    const checks = await runReadinessChecks();
+    return res.status(checks.ok ? 200 : 503).json({
+      status: checks.ok ? 'ok' : 'error',
+      checks: {
+        redis: checks.redis.ok ? 'ok' : 'error',
+        smtp: checks.smtp.ok ? 'ok' : 'error',
+      },
+    });
   });
 
   apiRouter.get('/openapi.json', otherApiLimiter, (_req, res) => {
@@ -483,6 +699,22 @@ function createApp({ config, redis, store, rateLimits = {} }) {
     } catch {
       res.json({ domains: config.domains });
     }
+  });
+
+  apiRouter.get('/domains/status', otherApiLimiter, async (_req, res) => {
+    const [smtpCheck, domainStatuses] = await Promise.all([
+      checkSmtpStatus(),
+      Promise.all(config.domains.map((d) => inspectDomainMx(d))),
+    ]);
+
+    res.json({
+      smtp: {
+        ok: Boolean(smtpCheck.ok),
+        port: smtpCheck.port || null,
+      },
+      inboundWebhookEnabled: Boolean(config.inboundWebhookSecret),
+      domains: domainStatuses,
+    });
   });
 
   apiRouter.get('/meta', otherApiLimiter, async (_req, res) => {
@@ -538,18 +770,16 @@ function createApp({ config, redis, store, rateLimits = {} }) {
       return res.status(404).json({ error: 'Not found.' });
     }
 
-    let redisStatus = 'error';
-    try {
-      const pong = await redis.ping();
-      if (pong === 'PONG') redisStatus = 'ok';
-    } catch {
-      redisStatus = 'error';
-    }
+    const checks = await runReadinessChecks();
+    const redisStatus = checks.redis.ok ? 'ok' : 'error';
+    const smtpStatus = checks.smtp.ok ? 'ok' : 'error';
 
     return res.status(200).json({
-      status: redisStatus === 'ok' ? 'ok' : 'degraded',
+      status: checks.ok ? 'ok' : 'degraded',
       uptimeSec: Math.floor(process.uptime()),
       redisStatus,
+      smtpStatus,
+      smtpPort: checks.smtp.port || null,
       domains: config.domains,
       ttlMinutes: config.inboxTtlMinutes,
       maxMessages: config.maxMessages,
@@ -701,6 +931,46 @@ function createApp({ config, redis, store, rateLimits = {} }) {
     } catch (err) {
       console.error('Extend inbox error:', err.message);
       return res.status(500).json({ error: 'Failed to extend inbox.' });
+    }
+  });
+
+  apiRouter.post('/inbox/:address/test-email', otherApiLimiter, requireInboxAuth, async (req, res) => {
+    try {
+      const auth = await store.getAuthorizedInbox(req.inboxAddress, req.inboxToken);
+      if (!auth) {
+        return res.status(404).json({ error: 'Inbox not found.' });
+      }
+      if (auth.inbox && auth.inbox.upstream) {
+        return res.status(400).json({
+          error: 'Internal SMTP test delivery only applies to your own-server domains.',
+        });
+      }
+
+      const senderDomain = config.domains[0] || 'localhost';
+      await sendInternalSmtpMail({
+        smtpServer,
+        to: auth.address,
+        from: `postmaster@${senderDomain}`,
+        subject: `SMTP delivery test for ${auth.address}`,
+        text: [
+          `Hello,`,
+          ``,
+          `This message was delivered over SMTP directly to ${auth.address} via your internal server.`,
+          `Your @${senderDomain} SMTP receiver, MIME parser, HTML sanitizer, and storage pipeline are working.`,
+        ].join('\n'),
+        html: [
+          `<p>Hello,</p>`,
+          `<p>This message was delivered over <strong>SMTP</strong> directly to <code>${auth.address}</code> via your internal server.</p>`,
+          `<p>Your <strong>@${senderDomain}</strong> SMTP receiver, MIME parser, HTML sanitizer, and storage pipeline are working.</p>`,
+        ].join(''),
+      });
+
+      return res.status(202).json({ sent: true, to: auth.address });
+    } catch (err) {
+      console.error('Internal SMTP test email error:', err.message);
+      return res.status(503).json({
+        error: 'Internal SMTP server is unavailable right now.',
+      });
     }
   });
 

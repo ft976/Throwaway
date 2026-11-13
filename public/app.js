@@ -30,6 +30,7 @@
     refreshBtn: document.getElementById('refresh-btn'),
     refreshIcon: document.getElementById('refresh-icon'),
     changeBtn: document.getElementById('change-btn'),
+    composeBtn: document.getElementById('compose-btn'),
     deleteAddressBtn: document.getElementById('delete-address-btn'),
     extendBtn: document.getElementById('extend-btn'),
     expiryText: document.getElementById('expiry-text'),
@@ -41,6 +42,9 @@
     inboxSection: document.getElementById('inbox-section'),
     inboxCount: document.getElementById('inbox-count'),
     emptyState: document.getElementById('empty-state'),
+    emptyActions: document.getElementById('empty-actions'),
+    sendTestBtn: document.getElementById('send-test-btn'),
+    usePublicBtn: document.getElementById('use-public-btn'),
     messageList: document.getElementById('message-list'),
     messageView: document.getElementById('message-view'),
     backBtn: document.getElementById('back-btn'),
@@ -70,7 +74,16 @@
     deleteCloseBtn: document.getElementById('delete-close-btn'),
     deleteCancelBtn: document.getElementById('delete-cancel-btn'),
     deleteConfirmBtn: document.getElementById('delete-confirm-btn'),
-    abuseLink: document.getElementById('abuse-link'),
+    composeDialog: document.getElementById('compose-dialog'),
+    composeForm: document.getElementById('compose-form'),
+    composeCloseBtn: document.getElementById('compose-close-btn'),
+    composeCancelBtn: document.getElementById('compose-cancel-btn'),
+    composeFrom: document.getElementById('compose-from'),
+    composeTo: document.getElementById('compose-to'),
+    composeSubject: document.getElementById('compose-subject'),
+    composeBody: document.getElementById('compose-body'),
+    composeError: document.getElementById('compose-error'),
+    composeSubmitBtn: document.getElementById('compose-submit-btn'),
     inboxTokenInput: document.getElementById('inbox-token-input'),
     toggleTokenBtn: document.getElementById('toggle-token-btn'),
     copyTokenBtn: document.getElementById('copy-token-btn'),
@@ -90,6 +103,8 @@
   const state = {
     inbox: null, // { address, token, expiresAt, ttlMs }
     domains: [],
+    ownDomains: [],
+    domainStatuses: [],
     messages: [],
     knownIds: new Set(),
     etag: null,
@@ -516,11 +531,39 @@
     return res;
   }
 
+  function updateOwnDomainGuidance({ preserveNotice = false } = {}) {
+    if (!els.emptyActions) return;
+    if (!state.inbox) {
+      els.emptyActions.hidden = true;
+      return;
+    }
+
+    const currentDomain = (state.inbox.address.split('@')[1] || '').toLowerCase();
+    const isOwnDomain = state.ownDomains.includes(currentDomain);
+    const hasPublicAlternative = state.domains.some((d) => !state.ownDomains.includes(d));
+
+    els.emptyActions.hidden = !isOwnDomain;
+    if (els.usePublicBtn) {
+      els.usePublicBtn.hidden = !(isOwnDomain && hasPublicAlternative);
+    }
+
+    if (!preserveNotice && isOwnDomain) {
+      const domStatus = state.domainStatuses.find((s) => s.domain === currentDomain);
+      if (domStatus && (domStatus.mxStatus === 'null-mx' || domStatus.mxStatus === 'missing')) {
+        showNotice(
+          `Your internal server for @${currentDomain} is ready (use "Send test email" below to verify). External senders like Gmail cannot deliver to @${currentDomain} yet because its public DNS MX record is not pointed to this server — switch to a public domain via "Change" for immediate external mail.`,
+          false
+        );
+      }
+    }
+  }
+
   async function loadDomainsAndMeta() {
     try {
-      const [domRes, metaRes] = await Promise.all([
+      const [domRes, metaRes, statusRes] = await Promise.all([
         window.fetch('/api/domains', { cache: 'no-store' }),
         window.fetch('/api/meta', { cache: 'no-store' }),
+        window.fetch('/api/domains/status', { cache: 'no-store' }).catch(() => null),
       ]);
 
       let domains = [];
@@ -530,10 +573,6 @@
         const meta = await metaRes.json();
         if (Array.isArray(meta.domains)) domains = meta.domains;
         if (Array.isArray(meta.ownDomains)) ownDomains = meta.ownDomains;
-        if (meta.abuseEmail && els.abuseLink) {
-          els.abuseLink.textContent = meta.abuseEmail;
-          els.abuseLink.href = `mailto:${meta.abuseEmail}`;
-        }
       }
 
       if (domRes.ok) {
@@ -543,7 +582,15 @@
         }
       }
 
+      if (statusRes && statusRes.ok) {
+        const statusData = await statusRes.json().catch(() => null);
+        if (statusData && Array.isArray(statusData.domains)) {
+          state.domainStatuses = statusData.domains;
+        }
+      }
+
       state.domains = domains;
+      state.ownDomains = ownDomains;
       els.domainSelect.textContent = '';
 
       const ownSet = new Set(ownDomains);
@@ -579,6 +626,8 @@
           els.domainSelect.appendChild(opt);
         }
       }
+
+      updateOwnDomainGuidance();
     } catch {
       // Non-fatal metadata load failure
     }
@@ -615,8 +664,10 @@
     renderInboxList();
     if (noticeMessage) {
       showNotice(noticeMessage, false);
+      updateOwnDomainGuidance({ preserveNotice: true });
     } else {
       showNotice('');
+      updateOwnDomainGuidance();
     }
   }
 
@@ -893,6 +944,7 @@
       updateApiSecretsUI();
       renderInboxList();
       showNotice('');
+      updateOwnDomainGuidance();
       els.changeDialog.close();
       announce(`Address changed to ${data.address}`);
     } catch {
@@ -900,6 +952,112 @@
       els.changeError.hidden = false;
     } finally {
       els.changeSubmitBtn.disabled = false;
+    }
+  }
+
+  function openComposeDialog() {
+    if (!state.inbox || !els.composeDialog) return;
+    els.composeError.hidden = true;
+    els.composeError.textContent = '';
+    els.composeFrom.value = state.inbox.address;
+    els.composeDialog.showModal();
+    els.composeTo.focus();
+  }
+
+  async function handleComposeSubmit(event) {
+    event.preventDefault();
+    if (!state.inbox || !els.composeSubmitBtn) return;
+
+    const to = els.composeTo.value.trim().toLowerCase();
+    const subject = els.composeSubject.value.trim();
+    const text = els.composeBody.value;
+
+    if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+      els.composeError.textContent = 'Please enter a valid recipient email address.';
+      els.composeError.hidden = false;
+      els.composeTo.focus();
+      return;
+    }
+
+    if (!text.trim()) {
+      els.composeError.textContent = 'Please enter a message body.';
+      els.composeError.hidden = false;
+      els.composeBody.focus();
+      return;
+    }
+
+    els.composeError.hidden = true;
+    els.composeSubmitBtn.disabled = true;
+    const origLabel = els.composeSubmitBtn.textContent;
+    els.composeSubmitBtn.textContent = 'Sending...';
+
+    try {
+      const res = await apiRequest(
+        `/api/v1/inbox/${encodeURIComponent(state.inbox.address)}/send`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ to, subject, text }),
+        }
+      );
+
+      const data = await res.json().catch(() => ({}));
+
+      if (res.status === 404 && data.error === 'Inbox not found.') {
+        els.composeDialog.close();
+        await createNewRandomInbox('Your previous address expired. A new address has been issued.');
+        return;
+      }
+
+      if (!res.ok) {
+        els.composeError.textContent = data.error || 'Could not send email.';
+        els.composeError.hidden = false;
+        return;
+      }
+
+      els.composeDialog.close();
+      els.composeForm.reset();
+      showNotice(`Email sent to ${data.to} via ${data.transport}.`, false);
+      announce(`Email sent to ${data.to}`);
+
+      const targetDomain = (data.to.split('@')[1] || '').toLowerCase();
+      if (data.to === state.inbox.address || state.ownDomains.includes(targetDomain)) {
+        await pollInbox({ manual: true });
+      }
+    } catch {
+      els.composeError.textContent = 'Network error while sending email. Please try again.';
+      els.composeError.hidden = false;
+    } finally {
+      els.composeSubmitBtn.disabled = false;
+      els.composeSubmitBtn.textContent = origLabel;
+    }
+  }
+
+  async function handleSendTestEmail() {
+    if (!state.inbox || !els.sendTestBtn) return;
+    els.sendTestBtn.disabled = true;
+    const originalLabel = els.sendTestBtn.textContent;
+    els.sendTestBtn.textContent = 'Sending...';
+    try {
+      const res = await apiRequest(
+        `/api/v1/inbox/${encodeURIComponent(state.inbox.address)}/test-email`,
+        { method: 'POST' }
+      );
+      if (res.status === 404) {
+        await createNewRandomInbox('Your previous address expired. A new address has been issued.');
+        return;
+      }
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        showNotice(errData.error || 'Could not send test email.', true);
+        return;
+      }
+      await pollInbox({ manual: true });
+      announce('Test email delivered over SMTP');
+    } catch {
+      showNotice('Could not reach internal SMTP server right now.', true);
+    } finally {
+      els.sendTestBtn.disabled = false;
+      els.sendTestBtn.textContent = originalLabel;
     }
   }
 
@@ -1089,8 +1247,21 @@
       pollInbox({ manual: true });
     });
     els.extendBtn.addEventListener('click', extendInboxTimer);
+    if (els.composeBtn) {
+      els.composeBtn.addEventListener('click', openComposeDialog);
+    }
     els.changeBtn.addEventListener('click', openChangeDialog);
     els.deleteAddressBtn.addEventListener('click', () => els.deleteDialog.showModal());
+
+    if (els.composeCloseBtn) {
+      els.composeCloseBtn.addEventListener('click', () => els.composeDialog.close());
+    }
+    if (els.composeCancelBtn) {
+      els.composeCancelBtn.addEventListener('click', () => els.composeDialog.close());
+    }
+    if (els.composeForm) {
+      els.composeForm.addEventListener('submit', handleComposeSubmit);
+    }
 
     els.changeCloseBtn.addEventListener('click', () => els.changeDialog.close());
     els.changeCancelBtn.addEventListener('click', () => els.changeDialog.close());
@@ -1136,6 +1307,19 @@
     });
 
     els.notifyBtn.addEventListener('click', toggleNotifications);
+
+    if (els.sendTestBtn) {
+      els.sendTestBtn.addEventListener('click', handleSendTestEmail);
+    }
+    if (els.usePublicBtn) {
+      els.usePublicBtn.addEventListener('click', () => {
+        openChangeDialog();
+        const firstPublic = state.domains.find((d) => !state.ownDomains.includes(d));
+        if (firstPublic) {
+          els.domainSelect.value = firstPublic;
+        }
+      });
+    }
 
     if (els.toggleTokenBtn) {
       els.toggleTokenBtn.addEventListener('click', () => {

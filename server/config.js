@@ -123,6 +123,13 @@ function loadConfig(env = process.env) {
     }
   }
 
+  const outboundSmtpHost = env.OUTBOUND_SMTP_HOST ? String(env.OUTBOUND_SMTP_HOST).trim() : '';
+  const outboundSmtpPort = parsePort(env.OUTBOUND_SMTP_PORT, 587, 'OUTBOUND_SMTP_PORT');
+  const outboundSmtpSecure = String(env.OUTBOUND_SMTP_SECURE || '').trim().toLowerCase() === 'true';
+  const outboundSmtpUser = env.OUTBOUND_SMTP_USER ? String(env.OUTBOUND_SMTP_USER).trim() : '';
+  const outboundSmtpPass = env.OUTBOUND_SMTP_PASS ? String(env.OUTBOUND_SMTP_PASS) : '';
+  const outboundSmtpFrom = env.OUTBOUND_SMTP_FROM ? String(env.OUTBOUND_SMTP_FROM).trim() : '';
+
   return {
     domains,
     httpPort,
@@ -144,6 +151,12 @@ function loadConfig(env = process.env) {
     corsOrigins,
     publicMailRelay,
     persistFile,
+    outboundSmtpHost,
+    outboundSmtpPort,
+    outboundSmtpSecure,
+    outboundSmtpUser,
+    outboundSmtpPass,
+    outboundSmtpFrom,
   };
 }
 

@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const { MemoryRedisClient } = require('../server/redis');
 const { createStore } = require('../server/store');
 const { createApp } = require('../server/api');
+const { createSmtpServer } = require('../server/smtp');
 
 function createTestConfig(overrides = {}) {
   return {
@@ -30,6 +31,7 @@ function createTestConfig(overrides = {}) {
 
 describe('REST API endpoints and security controls', () => {
   let server;
+  let smtpServer;
   let baseUrl;
   let redis;
   let store;
@@ -39,7 +41,10 @@ describe('REST API endpoints and security controls', () => {
     config = createTestConfig();
     redis = new MemoryRedisClient();
     store = createStore(redis, config);
-    const app = createApp({ config, redis, store });
+    smtpServer = createSmtpServer({ config, store });
+    await new Promise((resolve) => smtpServer.listen(0, '127.0.0.1', resolve));
+
+    const app = createApp({ config, redis, store, smtpServer });
     server = http.createServer(app);
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const addr = server.address();
@@ -47,6 +52,9 @@ describe('REST API endpoints and security controls', () => {
   });
 
   afterEach(async () => {
+    if (smtpServer && smtpServer.server && smtpServer.server.listening) {
+      await new Promise((resolve) => smtpServer.close(resolve));
+    }
     if (server) {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -55,15 +63,65 @@ describe('REST API endpoints and security controls', () => {
     }
   });
 
-  it('serves /healthz and /api/domains', async () => {
+  it('serves /healthz (verifying Redis + SMTP), /api/health, and /api/domains', async () => {
     const health = await fetch(`${baseUrl}/healthz`);
     expect(health.status).toBe(200);
     expect(await health.text()).toBe('ok');
     expect(health.headers.get('cache-control')).toBe('no-store');
 
+    const apiHealth = await fetch(`${baseUrl}/api/health`);
+    expect(apiHealth.status).toBe(200);
+    expect(await apiHealth.json()).toEqual({
+      status: 'ok',
+      checks: { redis: 'ok', smtp: 'ok' },
+    });
+
     const domainsRes = await fetch(`${baseUrl}/api/domains`);
     expect(domainsRes.status).toBe(200);
     expect(await domainsRes.json()).toEqual({ domains: ['testmail.local', 'second.local'] });
+  });
+
+  it('reports 503 on /healthz and /api/health when internal SMTP server or Redis is unreachable', async () => {
+    await new Promise((resolve) => smtpServer.close(resolve));
+
+    const healthDownSmtp = await fetch(`${baseUrl}/healthz`);
+    expect(healthDownSmtp.status).toBe(503);
+    expect(await healthDownSmtp.text()).toBe('error');
+
+    const apiHealthDownSmtp = await fetch(`${baseUrl}/api/health`);
+    expect(apiHealthDownSmtp.status).toBe(503);
+    expect(await apiHealthDownSmtp.json()).toEqual({
+      status: 'error',
+      checks: { redis: 'ok', smtp: 'error' },
+    });
+
+    // Re-open SMTP on ephemeral port and simulate Redis failure
+    smtpServer = createSmtpServer({ config, store });
+    await new Promise((resolve) => smtpServer.listen(0, '127.0.0.1', resolve));
+    const originalPing = redis.ping.bind(redis);
+    redis.ping = async () => {
+      throw new Error('Redis disconnected');
+    };
+
+    const appWithBadRedis = createApp({ config, redis, store, smtpServer });
+    const badRedisServer = http.createServer(appWithBadRedis);
+    await new Promise((resolve) => badRedisServer.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const badRedisUrl = `http://127.0.0.1:${badRedisServer.address().port}`;
+      const healthDownRedis = await fetch(`${badRedisUrl}/healthz`);
+      expect(healthDownRedis.status).toBe(503);
+
+      const apiHealthDownRedis = await fetch(`${badRedisUrl}/api/health`);
+      expect(apiHealthDownRedis.status).toBe(503);
+      expect(await apiHealthDownRedis.json()).toEqual({
+        status: 'error',
+        checks: { redis: 'error', smtp: 'ok' },
+      });
+    } finally {
+      redis.ping = originalPing;
+      await new Promise((resolve) => badRedisServer.close(resolve));
+    }
   });
 
   it('creates, lists with ETag/304, reads, extends, deletes messages, and deletes inbox', async () => {

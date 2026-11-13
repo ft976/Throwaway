@@ -389,4 +389,197 @@ describe('Public Mail Relay and Disk Snapshot Persistence', () => {
 
     await redis.quit();
   });
+
+  it('discovers and routes inboxes.com, tempmail.plus (send + receive), and maildrop.cc domains', async () => {
+    let sentTempmailPlusPayload = null;
+    const mockFetch = makeMockFetch([
+      {
+        match: (url) => url === 'https://inboxes.com/api/v2/domain',
+        handle: () => ({
+          status: 200,
+          body: { domains: [{ qdn: 'getnada.com' }, { qdn: 'robot-mail.com' }] },
+        }),
+      },
+      {
+        match: (url) => url === 'https://inboxes.com/api/v2/inbox/alice%40getnada.com',
+        handle: () => ({
+          status: 200,
+          body: {
+            msgs: [
+              { uid: 'inb_1', f: 'Alerts <alerts@service.test>', s: 'Inboxes Delivery', cr: '2026-11-13T13:00:00Z', at: [] },
+            ],
+          },
+        }),
+      },
+      {
+        match: (url) => url === 'https://inboxes.com/api/v2/message/inb_1',
+        handle: () => ({
+          status: 200,
+          body: {
+            uid: 'inb_1',
+            ff: 'Alerts <alerts@service.test>',
+            s: 'Inboxes Delivery',
+            cr: '2026-11-13T13:00:00Z',
+            text: 'Plain code 112233',
+            html: '<p>Code <b>112233</b></p><script>xss()</script>',
+            at: [],
+          },
+        }),
+      },
+      {
+        match: (url) => url === 'https://tempmail.plus/api/mails?email=twprobe%40mailto.plus&limit=1&epin=',
+        handle: () => ({ status: 200, body: { result: true, mail_list: [] } }),
+      },
+      {
+        match: (url, method) => url === 'https://tempmail.plus/api/mails/' && method === 'POST',
+        handle: (_u, _m, opts) => {
+          sentTempmailPlusPayload = Object.fromEntries(new URLSearchParams(opts.body.toString()));
+          return { status: 200, body: { result: true, mail_id: 777 } };
+        },
+      },
+      {
+        match: (url) => url === 'https://tempmail.plus/api/mails?email=bob%40mailto.plus&limit=20&epin=',
+        handle: () => ({
+          status: 200,
+          body: {
+            result: true,
+            mail_list: [
+              { mail_id: 777, from_mail: 'sender@fexpost.com', from_name: 'Sender', subject: 'Hello Plus' },
+            ],
+          },
+        }),
+      },
+      {
+        match: (url) => url === 'https://tempmail.plus/api/mails/777?email=bob%40mailto.plus&epin=',
+        handle: () => ({
+          status: 200,
+          body: {
+            result: true,
+            from_mail: 'sender@fexpost.com',
+            from_name: 'Sender',
+            subject: 'Hello Plus',
+            date: '2026-11-13T13:05:00.000Z',
+            text: 'Hi from fexpost!',
+            html: '<p>Hi from <b>fexpost</b>!</p>',
+            attachments: [],
+          },
+        }),
+      },
+      {
+        match: (url, method) => url === 'https://api.maildrop.cc/graphql' && method === 'POST',
+        handle: (_u, _m, opts) => {
+          const parsed = JSON.parse(opts.body);
+          if (parsed.query.includes('twprobe')) {
+            return { status: 200, body: { data: { inbox: [] } } };
+          }
+          if (parsed.query.includes('inbox(mailbox: $m)')) {
+            return {
+              status: 200,
+              body: {
+                data: {
+                  inbox: [{ id: 'md_1', headerfrom: 'News <news@example.com>', subject: 'GraphQL Mail', date: '2026-11-13T13:10:00Z' }],
+                },
+              },
+            };
+          }
+          return {
+            status: 200,
+            body: {
+              data: {
+                message: {
+                  id: 'md_1',
+                  headerfrom: 'News <news@example.com>',
+                  mailfrom: 'news@example.com',
+                  subject: 'GraphQL Mail',
+                  date: '2026-11-13T13:10:00Z',
+                  data: [
+                    'From: News <news@example.com>',
+                    'To: carol@maildrop.cc',
+                    'Subject: GraphQL Mail',
+                    'Content-Type: text/html; charset=utf-8',
+                    '',
+                    '<p>Maildrop body</p><script>bad()</script>',
+                  ].join('\r\n'),
+                  html: '<p>Maildrop body</p>',
+                },
+              },
+            },
+          };
+        },
+      },
+    ]);
+
+    const config = createTestConfig({ domains: ['ft97.com'], publicMailRelay: 'auto' });
+    const redis = new MemoryRedisClient();
+    const relay = createPublicMailRelay({ fetchImpl: mockFetch });
+    const store = createStore(redis, config, { relay });
+    const app = createApp({ config, redis, store });
+    const server = http.createServer(app);
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+    try {
+      const domains = await store.getDomains();
+      expect(domains).toContain('ft97.com');
+      expect(domains).toContain('getnada.com');
+      expect(domains).toContain('robot-mail.com');
+      expect(domains).toContain('mailto.plus');
+      expect(domains).toContain('fexpost.com');
+      expect(domains).toContain('maildrop.cc');
+
+      // 1. inboxes.com receive + XSS scrub
+      const inboxesInbox = await store.createInbox({ username: 'alice', domain: 'getnada.com' });
+      expect(inboxesInbox.provider).toBe('inboxes.com');
+      const inboxesList = await store.listMessages(inboxesInbox.address, inboxesInbox.token);
+      expect(inboxesList.messages).toHaveLength(1);
+      const inboxesFull = await store.getMessage(inboxesInbox.address, inboxesList.messages[0].id, inboxesInbox.token);
+      expect(inboxesFull.message.html).toContain('112233');
+      expect(inboxesFull.message.html).not.toContain('<script');
+
+      // 2. tempmail.plus send via POST /api/v1/inbox/:address/send + receive
+      const plusSender = await store.createInbox({ username: 'sender', domain: 'fexpost.com' });
+      const sendRes = await fetch(`${baseUrl}/api/v1/inbox/${encodeURIComponent(plusSender.address)}/send`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${plusSender.token}`,
+        },
+        body: JSON.stringify({
+          to: 'bob@mailto.plus',
+          subject: 'Hello Plus',
+          text: 'Hi from fexpost!',
+        }),
+      });
+      expect(sendRes.status).toBe(202);
+      expect(await sendRes.json()).toEqual({
+        sent: true,
+        from: 'sender@fexpost.com',
+        to: 'bob@mailto.plus',
+        transport: 'tempmail.plus',
+      });
+      expect(sentTempmailPlusPayload).toEqual({
+        email: 'sender@fexpost.com',
+        to: 'bob@mailto.plus',
+        subject: 'Hello Plus',
+        text: 'Hi from fexpost!',
+      });
+
+      const plusRecipient = await store.createInbox({ username: 'bob', domain: 'mailto.plus' });
+      const plusList = await store.listMessages(plusRecipient.address, plusRecipient.token);
+      expect(plusList.messages).toHaveLength(1);
+      expect(plusList.messages[0].subject).toBe('Hello Plus');
+
+      // 3. maildrop.cc MIME parse + XSS scrub
+      const mdInbox = await store.createInbox({ username: 'carol', domain: 'maildrop.cc' });
+      expect(mdInbox.provider).toBe('maildrop.cc');
+      const mdList = await store.listMessages(mdInbox.address, mdInbox.token);
+      expect(mdList.messages).toHaveLength(1);
+      const mdFull = await store.getMessage(mdInbox.address, mdList.messages[0].id, mdInbox.token);
+      expect(mdFull.message.html).toContain('Maildrop body');
+      expect(mdFull.message.html).not.toContain('<script');
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+      await redis.quit();
+    }
+  });
 });

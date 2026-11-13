@@ -1,6 +1,6 @@
 # Throwaway — Disposable Temporary Email Service
 
-A production-ready, receive-only disposable email application built with Node.js 20, Express 4, `smtp-server`, `mailparser`, `sanitize-html`, Redis 7, and a vanilla HTML/CSS/JS frontend.
+A production-ready disposable email application built with Node.js 20, Express 4, `smtp-server`, `mailparser`, `sanitize-html`, `nodemailer`, Redis 7, and a vanilla HTML/CSS/JS frontend. Supports both receiving mail (own-server SMTP/webhook + zero-key public mail APIs) and sending mail from active inboxes.
 
 ## Quick Start (Docker Compose)
 
@@ -126,6 +126,8 @@ GET /api/v1/openapi.json
 | `GET /api/v1/inbox/:address` | `Authorization: Bearer <token>` | List messages (supports `ETag` / `If-None-Match` -> `304`) |
 | `GET /api/v1/inbox/:address/stream` | `Authorization: Bearer <token>` | Real-time Server-Sent Events (`connected`, `message`, `deleted`) |
 | `POST /api/v1/inbox/:address/extend` | `Authorization: Bearer <token>` | Reset inbox TTL across all Redis keys |
+| `POST /api/v1/inbox/:address/test-email` | `Authorization: Bearer <token>` | Deliver an internal SMTP test email to an own-server inbox |
+| `POST /api/v1/inbox/:address/send` | `Authorization: Bearer <token>` | Send an email from the active inbox (local SMTP, `@mailto.plus`, SMTP relay, or direct MX) |
 | `POST /api/v1/inbox/:address/rotate-token` | `Authorization: Bearer <token>` | Issue a new inbox Bearer token and invalidate the old one |
 | `DELETE /api/v1/inbox/:address` | `Authorization: Bearer <token>` | Immediately delete inbox and all messages |
 | `GET /api/v1/inbox/:address/messages/:id` | `Authorization: Bearer <token>` | Read sanitized HTML + plain text + attachment metadata, marks `read` |
@@ -173,4 +175,14 @@ export default {
 ```
 
 3. Bind `INBOUND_WEBHOOK_SECRET` as an encrypted secret in the Cloudflare Worker settings. Incoming emails are verified, parsed by `mailparser`, sanitized by `sanitize-html`, pushed to SSE listeners, and auto-deleted on inbox expiry.
+
+## Public Mail Domains & Outbound Sending
+
+Alongside your own server domains (`DOMAINS`, e.g. `ft97.com`), Throwaway discovers and integrates zero-key public disposable mail providers (`mail.tm`, `tempmail.lol`, `guerrillamail`, `inboxes.com`, `tempmail.plus`, and `maildrop.cc`) via `PUBLIC_MAIL_RELAY=auto`.
+
+Outbound mail via `POST /api/v1/inbox/:address/send` (or the UI **Compose** dialog) routes automatically:
+
+1. **Own-server domains (`DOMAINS`)**: Delivered directly through the internal SMTP server.
+2. **Public `tempmail.plus` domains (`@mailto.plus`, `@fexpost.com`, `@fexbox.org`, `@mailbox.in.ua`, `@rover.info`, `@chitthi.in`, `@merepost.com`)**: Sent via the public `tempmail.plus` mail API.
+3. **External recipients**: Uses `OUTBOUND_SMTP_HOST` / `OUTBOUND_SMTP_PORT` / `OUTBOUND_SMTP_USER` / `OUTBOUND_SMTP_PASS` / `OUTBOUND_SMTP_FROM` if configured, or direct MX port 25 delivery when your host allows outbound port 25.
 

@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const { MemoryRedisClient } = require('../server/redis');
 const { createStore } = require('../server/store');
 const { createApp } = require('../server/api');
+const { createSmtpServer } = require('../server/smtp');
 
 function createTestConfig(overrides = {}) {
   return {
@@ -35,6 +36,7 @@ function createTestConfig(overrides = {}) {
 
 describe('Public API v1 and Secrets APIs', () => {
   let server;
+  let smtpServer;
   let baseUrl;
   let redis;
   let store;
@@ -44,7 +46,10 @@ describe('Public API v1 and Secrets APIs', () => {
     config = createTestConfig();
     redis = new MemoryRedisClient();
     store = createStore(redis, config);
-    const app = createApp({ config, redis, store });
+    smtpServer = createSmtpServer({ config, store });
+    await new Promise((resolve) => smtpServer.listen(0, '127.0.0.1', resolve));
+
+    const app = createApp({ config, redis, store, smtpServer });
     server = http.createServer(app);
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
     const addr = server.address();
@@ -52,6 +57,9 @@ describe('Public API v1 and Secrets APIs', () => {
   });
 
   afterEach(async () => {
+    if (smtpServer && smtpServer.server && smtpServer.server.listening) {
+      await new Promise((resolve) => smtpServer.close(resolve));
+    }
     if (server) {
       await new Promise((resolve) => server.close(resolve));
     }
@@ -74,7 +82,10 @@ describe('Public API v1 and Secrets APIs', () => {
 
     const healthRes = await fetch(`${baseUrl}/api/v1/health`);
     expect(healthRes.status).toBe(200);
-    expect(await healthRes.json()).toEqual({ status: 'ok' });
+    expect(await healthRes.json()).toEqual({
+      status: 'ok',
+      checks: { redis: 'ok', smtp: 'ok' },
+    });
 
     const metaRes = await fetch(`${baseUrl}/api/v1/meta`);
     expect(metaRes.status).toBe(200);
@@ -321,6 +332,7 @@ describe('Public API v1 and Secrets APIs', () => {
     const status = await okAuth.json();
     expect(status.status).toBe('ok');
     expect(status.redisStatus).toBe('ok');
+    expect(status.smtpStatus).toBe('ok');
     expect(status.inboundWebhookEnabled).toBe(true);
   });
 
